@@ -94,6 +94,62 @@ async function iaSearch(q, rows = 20) {
 const one = v => Array.isArray(v) ? v[0] : v;
 const iaCard = d => ({ id: d.identifier, media_type: "ia", title: one(d.title), poster_path: IA + "/services/img/" + d.identifier });
 
+/* ---------- Fonti aggiunte dall'utente (come i link di Veezie) ---------- */
+const httpOnly = u => /^https?:\/\//i.test(u || "") ? u : "";
+async function detectSource(url) {
+  const m = url.match(/^https?:\/\/(?:www\.)?archive\.org\/(?:details|download)\/([\w.\-]+)\/?$/i);
+  if (m) {
+    try { const j = await (await fetch(IA + "/metadata/" + m[1])).json();
+      return { kind: j.metadata?.mediatype === "collection" ? "iacol" : "iaitem", id: m[1] }; } catch { return null; }
+  }
+  try {
+    const t = await (await fetch(url)).text();
+    if (/^\s*#EXTM3U/.test(t) && /#EXTINF/.test(t) && !/#EXT-X-/.test(t)) return { kind: "m3u" };
+    try { const j = JSON.parse(t), a = Array.isArray(j) ? j : j.items;
+      if (Array.isArray(a) && a.length && a[0].title && httpOnly(a[0].url)) return { kind: "json" }; } catch {}
+  } catch {}
+  return null;
+}
+const srcCache = new Map();
+async function loadEntries(l) {
+  if (srcCache.has(l.url)) return srcCache.get(l.url);
+  let out = [];
+  if (l.kind === "iacol") out = (await iaSearch("collection:" + l.id, 30)).map(d => ({ ia: d.identifier, title: one(d.title), poster: IA + "/services/img/" + d.identifier }));
+  else if (l.kind === "iaitem") { const j = await (await fetch(IA + "/metadata/" + l.id)).json(); out = [{ ia: l.id, title: one(j.metadata?.title) || l.id, poster: IA + "/services/img/" + l.id }]; }
+  else if (l.kind === "m3u") {
+    const lines = (await (await fetch(l.url)).text()).split(/\r?\n/); let cur = null;
+    for (const ln of lines) {
+      if (ln.startsWith("#EXTINF")) cur = { title: (ln.split(",").slice(1).join(",") || "Senza titolo").trim(), poster: httpOnly((ln.match(/tvg-logo="([^"]*)"/) || [])[1]) };
+      else if (cur && ln.trim() && !ln.startsWith("#")) { const u = httpOnly(ln.trim()); if (u) out.push({ ...cur, url: u }); cur = null; }
+    }
+  } else if (l.kind === "json") {
+    const j = JSON.parse(await (await fetch(l.url)).text());
+    out = (Array.isArray(j) ? j : j.items).filter(x => x && x.title && httpOnly(x.url)).map(x => ({ title: String(x.title), url: x.url, poster: httpOnly(x.poster || x.image), desc: x.description ? String(x.description) : "" }));
+  }
+  srcCache.set(l.url, out); return out;
+}
+const srcCards = (i, list) => list.map((e, n) => e.ia ? card(iaCard({ identifier: e.ia, title: e.title }))
+  : card({ id: i + "/" + n, media_type: "play", title: e.title, poster_path: e.poster }));
+
+async function playView(i, n) {
+  setTab("free");
+  $("#view").innerHTML = `<div class="spin">Carico…</div>`;
+  try {
+    const l = state.links[i]; if (!l?.kind) throw new Error("fonte non trovata");
+    const e = (await loadEntries(l))[n]; if (!e || !e.url) throw new Error("video non trovato");
+    $("#view").innerHTML = `<a class="back" href="javascript:history.back()" aria-label="Indietro">‹</a><div style="padding-top:44px">
+      <video id="pl" controls playsinline preload="metadata" ${e.poster ? `poster="${esc(e.poster)}"` : ""} style="width:100%;border-radius:12px;background:#000;aspect-ratio:16/9"></video>
+      <h1 style="font-size:26px;margin-top:14px">${esc(e.title)}</h1>
+      ${e.desc ? `<p>${esc(e.desc.slice(0, 700))}</p>` : ""}
+      <p class="muted" style="font-size:12px">Fonte: ${esc(l.name)}</p></div>`;
+    const v = $("#pl");
+    if (/\.m3u8(\?|$)/i.test(e.url) && !v.canPlayType("application/vnd.apple.mpegurl")) {
+      await new Promise((ok, no) => { const sc = document.createElement("script"); sc.src = "https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.17/hls.min.js"; sc.onload = ok; sc.onerror = no; document.head.append(sc); });
+      if (window.Hls && Hls.isSupported()) { const h = new Hls(); h.loadSource(e.url); h.attachMedia(v); } else v.src = e.url;
+    } else v.src = e.url;
+  } catch (e) { $("#view").innerHTML = `<div class="empty">Non riesco a riprodurre questo video (${esc(e.message)}).</div>`; }
+}
+
 function free(q = "") {
   setTab("free");
   $("#view").innerHTML = `<h1>Gratis</h1><p class="muted" style="margin-top:-8px">Film e cartoni liberi da diritti, da Internet Archive.</p>
@@ -109,7 +165,13 @@ function free(q = "") {
       } catch (e) { res.innerHTML = errorView(e); }
       return;
     }
-    res.innerHTML = rows.map(([t], i) => `<h2>${t}</h2><div class="row" id="r${i}"><div class="spin">Carico…</div></div>`).join("");
+    const srcs = state.links.map((l, i) => [l, i]).filter(([l]) => l.kind);
+    res.innerHTML = srcs.map(([l, i]) => `<h2>${esc(l.name)}</h2><div class="row" id="s${i}"><div class="spin">Carico…</div></div>`).join("") + rows.map(([t], i) => `<h2>${t}</h2><div class="row" id="r${i}"><div class="spin">Carico…</div></div>`).join("");
+    srcs.forEach(async ([l, i]) => {
+      const el = () => $("#s" + i);
+      try { const list = await loadEntries(l); if (el()) el().innerHTML = list.length ? srcCards(i, list).join("") : `<div class="muted">Nessun video in questa fonte.</div>`; }
+      catch { if (el()) el().innerHTML = `<div class="muted">Non riesco a leggere questa fonte (il sito potrebbe non consentire l'accesso dal browser).</div>`; }
+    });
     rows.forEach(async ([, q], i) => {
       try { const l = await iaSearch(q, 20); const el = $("#r" + i); if (el) el.innerHTML = l.map(d => card(iaCard(d))).join(""); }
       catch { const el = $("#r" + i); if (el) el.innerHTML = `<div class="muted">Non riesco a caricare questa sezione.</div>`; }
@@ -307,19 +369,23 @@ function settings() {
     <div class="card"><b>Chiave TMDB (facoltativa)</b><p class="muted" style="margin:4px 0;font-size:13px">Senza chiave l'app usa TVmaze per le serie. Con la chiave aggiungi anche i film, le trame in italiano e le piattaforme in Italia.</p><input id="k" value="${esc(state.key)}" placeholder="Chiave API o token" autocapitalize="off" autocorrect="off">
       <button class="btn" id="ksave" style="width:100%">Salva</button></div>
     <h2>Link esterni</h2>
-    <p class="muted" style="margin-top:-4px">I tuoi segnalibri (il tuo NAS, Jellyfin, Plex, i siti dei servizi che usi). Si aprono in una nuova scheda e compaiono nelle schede dei titoli.</p>
+    <p class="muted" style="margin-top:-4px">I tuoi segnalibri (il tuo NAS, Jellyfin, Plex, i siti dei servizi che usi). Se è una collezione di Internet Archive, una lista M3U o un catalogo JSON, i suoi video compaiono da soli in Gratis. Gli altri link restano segnalibri.</p>
     <div class="card"><input id="ln" placeholder="Nome"><input id="lu" placeholder="https://…" inputmode="url" autocapitalize="off">
       <button class="btn" id="ladd" style="width:100%">Aggiungi link</button></div>
-    ${state.links.length ? `<div class="list">${state.links.map((l, i) => `<div><span class="grow">${esc(l.name)}<div class="sub">${esc(l.url)}</div></span><button data-d="${i}" style="color:var(--red)">Elimina</button></div>`).join("")}</div>` : ""}
+    ${state.links.length ? `<div class="list">${state.links.map((l, i) => `<div><span class="grow">${esc(l.name)}<div class="sub">${l.kind ? "Fonte video · " : ""}${esc(l.url)}</div></span><button data-d="${i}" style="color:var(--red)">Elimina</button></div>`).join("")}</div>` : ""}
     <h2>Dati</h2>
     <div class="list"><button id="exp">Esporta backup (JSON)</button><button id="imp">Importa backup</button></div>
     <p class="muted" style="font-size:13px">I tuoi dati restano su questo dispositivo. Questo prodotto usa l'API TMDB ma non è approvato né certificato da TMDB. Non contiene né estrae contenuti video.</p>`;
   bindKey();
-  $("#ladd").onclick = () => {
+  $("#ladd").onclick = async () => {
     const name = $("#ln").value.trim(); let url = $("#lu").value.trim();
     if (!/^https?:\/\//i.test(url)) url = "https://" + url;
     try { new URL(url); } catch { return toast("Indirizzo non valido"); }
-    state.links.push({ name: name || new URL(url).hostname, url }); save(); settings();
+    $("#ladd").textContent = "Controllo…";
+    const src = await detectSource(url);
+    state.links.push({ name: name || new URL(url).hostname, url, ...(src || {}) }); save();
+    toast(src ? "Fonte aggiunta: i video sono in Gratis" : "Salvato come segnalibro (non è un catalogo che so leggere)");
+    settings();
   };
   document.querySelectorAll("[data-d]").forEach(b => b.onclick = () => { state.links.splice(+b.dataset.d, 1); save(); settings(); });
   $("#exp").onclick = () => {
@@ -346,6 +412,7 @@ function route() {
   if (!p.length) return home();
   if (p[0] === "search") return search();
   if (p[0] === "free") return free();
+  if (p[0] === "play" && /^\d+$/.test(p[1] || "") && /^\d+$/.test(p[2] || "")) return playView(+p[1], +p[2]);
   if (p[0] === "ia" && /^[\w.\-]+$/.test(p[1] || "")) return iaDetail(p[1]);
   if (p[0] === "library") return library();
   if (p[0] === "settings") return settings();
