@@ -33,7 +33,30 @@ async function tmdb(path, params = {}) {
   cache.set(url, j);
   return j;
 }
-const poster = (p, w = "w342") => p ? IMG + w + p : "";
+const poster = (p, w = "w342") => !p ? "" : /^https?:/.test(p) ? p : IMG + w + p;
+/* TVmaze: fonte senza chiave, usata per le serie quando non c'è una chiave TMDB */
+async function tvm(path) {
+  const url = "https://api.tvmaze.com" + path;
+  if (cache.has(url)) return cache.get(url);
+  const r = await fetch(url);
+  if (!r.ok) throw new Error("http" + r.status);
+  const j = await r.json(); cache.set(url, j); return j;
+}
+const tvmImg = (s, k = "medium") => (s?.image?.[k] || "").replace(/^http:/, "https:");
+const tvmCard = s => ({ id: s.id, media_type: "tvm", name: s.name, poster_path: tvmImg(s) });
+const strip = h => String(h || "").replace(/<[^>]*>/g, "");
+async function loadTvm(id) {
+  const s = await tvm(`/shows/${id}?embed[]=episodes&embed[]=cast`);
+  const eps = (s._embedded?.episodes || []).filter(e => e.number != null);
+  const nums = [...new Set(eps.map(e => e.season))].sort((a, b) => a - b);
+  const net = [s.webChannel, s.network].filter(Boolean).map(n => n.name);
+  return { id: s.id, name: s.name, first_air_date: s.premiered || "", runtime: s.averageRuntime || s.runtime,
+    vote_average: s.rating?.average || 0, poster_path: tvmImg(s, "original"), backdrop_path: "",
+    genres: (s.genres || []).map(name => ({ name })), overview: strip(s.summary),
+    credits: { cast: (s._embedded?.cast || []).map(c => ({ name: c.person.name })) }, videos: { results: [] },
+    number_of_seasons: nums.length, _eps: eps, _net: net, _site: s.officialSite || s.url,
+    seasons: nums.map(n => ({ season_number: n, name: "Stagione " + n, episode_count: eps.filter(e => e.season === n).length })) };
+}
 const kind = x => x.media_type || (x.first_air_date !== undefined || x.name ? "tv" : "movie");
 
 /* ---------- UI helpers ---------- */
@@ -58,10 +81,23 @@ function bindKey() {
 }
 
 /* ---------- views ---------- */
+async function homeTvm() {
+  const day = new Date().toISOString().slice(0, 10);
+  const [web, us] = await Promise.all([tvm("/schedule/web?date=" + day), tvm("/schedule?country=US&date=" + day)]);
+  const uniq = arr => { const m = new Map(); arr.forEach(s => s && s.image && !m.has(s.id) && m.set(s.id, s)); return [...m.values()].sort((a, b) => (b.weight || 0) - (a.weight || 0)).slice(0, 24); };
+  const w = uniq(web.map(e => e._embedded?.show)), t = uniq(us.map(e => e.show || e._embedded?.show));
+  const cont = Object.values(state.items).filter(i => i.type === "tvm" && i.status !== "watched" && Object.keys(i.eps || {}).length);
+  $("#view").innerHTML = `<h1>Home</h1>
+    ${cont.length ? `<h2>Continua a guardare</h2><div class="row">${cont.map(i => card({ id: i.id, media_type: i.type, title: i.title, poster_path: i.poster })).join("")}</div>` : ""}
+    <h2>Nuovi episodi in streaming</h2><div class="row">${w.map(s => card(tvmCard(s))).join("")}</div>
+    <h2>In TV oggi</h2><div class="row">${t.map(s => card(tvmCard(s))).join("")}</div>
+    <p class="muted" style="font-size:12px">Serie TV da TVmaze. Per film e dati in italiano aggiungi una chiave TMDB nelle Impostazioni.</p>`;
+}
 async function home() {
   setTab("home");
   $("#view").innerHTML = `<h1>Home</h1><div class="spin">Carico…</div>`;
   try {
+    if (!state.key) return await homeTvm();
     const [tr, pm, pt] = await Promise.all([
       tmdb("/trending/all/week"), tmdb("/movie/popular"), tmdb("/tv/popular")
     ]);
@@ -90,8 +126,8 @@ function search(q = "") {
     const v = $("#q").value.trim(); const res = $("#res");
     if (v.length < 2) { res.innerHTML = ""; return; }
     try {
-      const r = await tmdb("/search/multi", { query: v });
-      const list = r.results.filter(x => x.media_type !== "person");
+      const list = state.key ? (await tmdb("/search/multi", { query: v })).results.filter(x => x.media_type !== "person")
+        : (await tvm("/search/shows?q=" + encodeURIComponent(v))).map(r => tvmCard(r.show));
       res.innerHTML = list.length ? `<div class="grid">${list.map(card).join("")}</div>` : `<div class="empty">Nessun risultato</div>`;
     } catch (e) { res.innerHTML = errorView(e); bindKey(); }
   };
@@ -103,11 +139,13 @@ async function detail(type, id) {
   setTab("");
   $("#view").innerHTML = `<div class="spin">Carico…</div>`;
   try {
-    const d = await tmdb(`/${type}/${id}`, { append_to_response: "credits,watch/providers,videos" });
+    const d = type === "tvm" ? await loadTvm(id) : await tmdb(`/${type}/${id}`, { append_to_response: "credits,watch/providers,videos" });
     const key = type + ":" + id, it = state.items[key];
     const title = d.title || d.name, year = (d.release_date || d.first_air_date || "").slice(0, 4);
     const prov = d["watch/providers"]?.results?.[REGION];
-    const provHtml = prov ? [["flatrate", "In abbonamento"], ["rent", "Noleggio"], ["buy", "Acquisto"]].filter(([k]) => prov[k]?.length)
+    const provHtml = type === "tvm" ? (d._net.length ? `<p>${d._net.map(n => `<span class="chip">${esc(n)}</span>`).join("")}</p>` : `<p class="muted">Piattaforma non indicata.</p>`)
+      + (d._site ? `<p style="font-size:14px"><a href="${esc(d._site)}" target="_blank" rel="noopener">Sito ufficiale ↗</a></p>` : "")
+      : prov ? [["flatrate", "In abbonamento"], ["rent", "Noleggio"], ["buy", "Acquisto"]].filter(([k]) => prov[k]?.length)
       .map(([k, l]) => `<h2 style="font-size:16px">${l}</h2>` + prov[k].map(p => `<span class="prov"><img src="${IMG}w92${p.logo_path}" alt=""><span>${esc(p.provider_name)}</span></span>`).join("")).join("")
       + (prov.link ? `<p class="muted" style="font-size:12px"><a href="${esc(prov.link)}" target="_blank" rel="noopener">Dettagli su TMDB/JustWatch</a></p>` : "") : `<p class="muted">Nessuna piattaforma trovata per l'Italia.</p>`;
     const trailer = (d.videos?.results || []).find(v => v.site === "YouTube" && v.type === "Trailer");
@@ -126,14 +164,14 @@ async function detail(type, id) {
         <p>${esc(d.overview || "Trama non disponibile.")}</p>
         ${trailer ? `<p><a href="https://www.youtube.com/watch?v=${esc(trailer.key)}" target="_blank" rel="noopener">▶ Guarda il trailer</a></p>` : ""}
         <h2>Dove guardarlo</h2>${provHtml}
-        ${type === "tv" ? `<h2>Episodi</h2><div id="seasons"></div>` : ""}
+        ${type !== "movie" ? `<h2>Episodi</h2><div id="seasons"></div>` : ""}
         ${cast.length ? `<h2>Cast</h2><div>${cast.map(c => `<span class="chip">${esc(c.name)}</span>`).join("")}</div>` : ""}
         ${state.links.length ? `<h2>I tuoi link</h2><div class="list">${state.links.map(l => `<a href="${esc(l.url)}" target="_blank" rel="noopener"><span class="grow">${esc(l.name)}</span><span class="muted">↗</span></a>`).join("")}</div>` : ""}
       </div>`;
     const ensure = () => (state.items[key] ||= { type, id: +id, title, poster: d.poster_path, status: "", eps: {}, added: Date.now() });
     $("#bw").onclick = () => { const i = ensure(); i.status = i.status === "watchlist" ? "" : "watchlist"; clean(key); save(); detail(type, id); };
     if ($("#bs")) $("#bs").onclick = () => { const i = ensure(); i.status = i.status === "watched" ? "" : "watched"; clean(key); save(); detail(type, id); };
-    if (type === "tv") seasons(d, key, ensure);
+    if (type !== "movie") seasons(d, key, ensure);
   } catch (e) { $("#view").innerHTML = errorView(e); bindKey(); }
 }
 function clean(key) { const i = state.items[key]; if (i && !i.status && !Object.keys(i.eps || {}).length) delete state.items[key]; }
@@ -152,7 +190,8 @@ async function openSeason(d, key, ensure, n) {
   sh.innerHTML = `<div><div class="spin">Carico…</div></div>`;
   sh.onclick = e => { if (e.target === sh) closeSheet(d, key, ensure); };
   try {
-    const s = await tmdb(`/tv/${d.id}/season/${n}`);
+    const s = d._eps ? { name: "Stagione " + n, episodes: d._eps.filter(e => e.season === n).map(e => ({ episode_number: e.number, name: e.name, air_date: e.airdate })) }
+      : await tmdb(`/tv/${d.id}/season/${n}`);
     const render = () => {
       const eps = state.items[key]?.eps || {};
       sh.innerHTML = `<div><h2 style="margin-top:0">${esc(s.name || "Stagione " + n)}</h2>
@@ -179,7 +218,7 @@ function library() {
   const watchedMovies = all.filter(i => i.type === "movie" && i.status === "watched").length;
   const eps = all.reduce((n, i) => n + Object.keys(i.eps || {}).length, 0);
   const shown = all.filter(i => libTab === "watchlist" ? i.status === "watchlist"
-    : libTab === "watched" ? (i.status === "watched" || (i.type === "tv" && Object.keys(i.eps || {}).length)) : true)
+    : libTab === "watched" ? (i.status === "watched" || ((i.type === "tv" || i.type === "tvm") && Object.keys(i.eps || {}).length)) : true)
     .sort((a, b) => b.added - a.added);
   $("#view").innerHTML = `<h1>Libreria</h1>
     <div class="stats"><div><b>${watchedMovies}</b><span>Film visti</span></div><div><b>${eps}</b><span>Episodi visti</span></div><div><b>${all.filter(i => i.status === "watchlist").length}</b><span>Da vedere</span></div></div>
@@ -191,7 +230,7 @@ function library() {
 function settings() {
   setTab("settings");
   $("#view").innerHTML = `<h1>Impostazioni</h1>
-    <div class="card"><b>Chiave TMDB</b><input id="k" value="${esc(state.key)}" placeholder="Chiave API o token" autocapitalize="off" autocorrect="off">
+    <div class="card"><b>Chiave TMDB (facoltativa)</b><p class="muted" style="margin:4px 0;font-size:13px">Senza chiave l'app usa TVmaze per le serie. Con la chiave aggiungi anche i film, le trame in italiano e le piattaforme in Italia.</p><input id="k" value="${esc(state.key)}" placeholder="Chiave API o token" autocapitalize="off" autocorrect="off">
       <button class="btn" id="ksave" style="width:100%">Salva</button></div>
     <h2>Link esterni</h2>
     <p class="muted" style="margin-top:-4px">I tuoi segnalibri (il tuo NAS, Jellyfin, Plex, i siti dei servizi che usi). Si aprono in una nuova scheda e compaiono nelle schede dei titoli.</p>
@@ -234,7 +273,7 @@ function route() {
   if (p[0] === "search") return search();
   if (p[0] === "library") return library();
   if (p[0] === "settings") return settings();
-  if ((p[0] === "movie" || p[0] === "tv") && /^\d+$/.test(p[1] || "")) return detail(p[0], p[1]);
+  if ((p[0] === "movie" || p[0] === "tv" || p[0] === "tvm") && /^\d+$/.test(p[1] || "")) return detail(p[0], p[1]);
   home();
 }
 window.addEventListener("hashchange", route);
