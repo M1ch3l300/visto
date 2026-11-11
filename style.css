@@ -23,7 +23,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
   padding:6px 0 calc(6px + var(--safe-b));background:var(--bar);
   -webkit-backdrop-filter:saturate(180%) blur(20px);backdrop-filter:saturate(180%) blur(20px);
   border-top:.5px solid var(--sep);z-index:10}
-.tabbar a{flex:1;display:flex;flex-direction:column;align-items:center;gap:2px;color:var(--muted);font-size:10px}
+.tabbar a{flex:1;min-width:0;display:flex;flex-direction:column;align-items:center;gap:2px;color:var(--muted);font-size:10px}
 .tabbar svg{width:26px;height:26px;fill:currentColor}
 .tabbar a.on{color:var(--blue)}
 .search{display:flex;align-items:center;gap:8px;background:var(--fill);border-radius:12px;padding:9px 12px;margin-bottom:8px}

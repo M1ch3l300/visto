@@ -80,6 +80,80 @@ function bindKey() {
   b.onclick = () => { state.key = $("#k").value.trim(); save(); route(); };
 }
 
+/* ---------- Internet Archive: video gratuiti e liberi da diritti ---------- */
+const IA = "https://archive.org";
+const SAFE = " AND mediatype:movies AND NOT title:(sex OR nude OR erotic OR porn) AND NOT collection:(adult OR nsfw)";
+async function iaSearch(q, rows = 20) {
+  const p = new URLSearchParams({ q: q + SAFE, rows, output: "json" });
+  p.append("fl[]", "identifier"); p.append("fl[]", "title"); p.append("sort[]", "downloads desc");
+  const url = IA + "/advancedsearch.php?" + p;
+  if (cache.has(url)) return cache.get(url);
+  const r = await fetch(url); if (!r.ok) throw new Error("http" + r.status);
+  const j = (await r.json()).response.docs; cache.set(url, j); return j;
+}
+const one = v => Array.isArray(v) ? v[0] : v;
+const iaCard = d => ({ id: d.identifier, media_type: "ia", title: one(d.title), poster_path: IA + "/services/img/" + d.identifier });
+
+function free(q = "") {
+  setTab("free");
+  $("#view").innerHTML = `<h1>Gratis</h1><p class="muted" style="margin-top:-8px">Film e cartoni liberi da diritti, da Internet Archive.</p>
+    <div class="search"><input id="q" type="search" placeholder="Cerca film e cartoni gratuiti" value="${esc(q)}"></div><div id="res"></div>`;
+  const res = $("#res");
+  const rows = [["Classici del cinema", "collection:feature_films"], ["Cartoni animati", "collection:animationandcartoons"], ["Film in italiano", "collection:feature_films AND language:(Italian OR ita)"]];
+  const run = async () => {
+    const v = $("#q").value.trim().replace(/["\\()]/g, " ");
+    if (v.length >= 2) {
+      res.innerHTML = `<div class="spin">Cerco…</div>`;
+      try { const l = await iaSearch(`title:(${v})`, 30);
+        res.innerHTML = l.length ? `<div class="grid">${l.map(d => card(iaCard(d))).join("")}</div>` : `<div class="empty">Nessun risultato</div>`;
+      } catch (e) { res.innerHTML = errorView(e); }
+      return;
+    }
+    res.innerHTML = rows.map(([t], i) => `<h2>${t}</h2><div class="row" id="r${i}"><div class="spin">Carico…</div></div>`).join("");
+    rows.forEach(async ([, q], i) => {
+      try { const l = await iaSearch(q, 20); const el = $("#r" + i); if (el) el.innerHTML = l.map(d => card(iaCard(d))).join(""); }
+      catch { const el = $("#r" + i); if (el) el.innerHTML = `<div class="muted">Non riesco a caricare questa sezione.</div>`; }
+    });
+  };
+  $("#q").oninput = () => { clearTimeout(searchTimer); searchTimer = setTimeout(run, 400); };
+  run();
+}
+
+async function iaDetail(id) {
+  setTab("free");
+  $("#view").innerHTML = `<div class="spin">Carico…</div>`;
+  try {
+    const m = await (await fetch(IA + "/metadata/" + encodeURIComponent(id))).json();
+    const meta = m.metadata || {};
+    const title = one(meta.title) || id, key = "ia:" + id, it = state.items[key];
+    const mp4 = (m.files || []).filter(f => /\.mp4$/i.test(f.name));
+    const byBig = [...mp4].sort((x, y) => (+y.size || 0) - (+x.size || 0));
+    const f = byBig.find(x => (+x.size || 0) < 400e6 && !/sample|trailer/i.test(x.name)) || byBig[byBig.length - 1];
+    const src = f ? `${IA}/download/${encodeURIComponent(id)}/${f.name.split("/").map(encodeURIComponent).join("/")}` : "";
+    const posterUrl = IA + "/services/img/" + encodeURIComponent(id);
+    const desc = strip(one(meta.description)).slice(0, 700);
+    $("#view").innerHTML = `
+      <a class="back" href="javascript:history.back()" aria-label="Indietro">‹</a>
+      <div style="padding-top:44px">
+      ${src ? `<video id="pl" controls playsinline preload="metadata" poster="${posterUrl}" src="${esc(src)}" style="width:100%;border-radius:12px;background:#000;aspect-ratio:16/9"></video>`
+        : `<div class="card">Qui non c'è un video riproducibile.<br><a href="${IA}/details/${encodeURIComponent(id)}" target="_blank" rel="noopener">Apri su Internet Archive ↗</a></div>`}
+      <h1 style="font-size:26px;margin-top:14px">${esc(title)}</h1>
+      <div class="muted">${esc(one(meta.year) || (one(meta.date) || "").slice(0, 4))}${meta.language ? " · " + esc(one(meta.language)) : ""}</div>
+      <div class="btns"><button class="btn ${it?.status === "watchlist" ? "on" : "alt"}" id="bw">${it?.status === "watchlist" ? "✓ In watchlist" : "+ Watchlist"}</button></div>
+      <p>${esc(desc) || "<span class='muted'>Descrizione non disponibile.</span>"}</p>
+      <p class="muted" style="font-size:12px">Fonte: <a href="${IA}/details/${encodeURIComponent(id)}" target="_blank" rel="noopener">Internet Archive</a>${meta.licenseurl ? ` · <a href="${esc(meta.licenseurl)}" target="_blank" rel="noopener">licenza</a>` : ""}</p></div>`;
+    const ensure = () => (state.items[key] ||= { type: "ia", id, title, poster: posterUrl, status: "", eps: {}, added: Date.now() });
+    $("#bw").onclick = () => { const i = ensure(); i.status = i.status === "watchlist" ? "" : "watchlist"; clean(key); save(); iaDetail(id); };
+    const v = $("#pl");
+    if (v) {
+      let last = 0; const pos = store.get("pos." + id, 0);
+      v.addEventListener("loadedmetadata", () => { if (pos > 5 && pos < v.duration - 10) v.currentTime = pos; });
+      v.addEventListener("timeupdate", () => { if (Date.now() - last > 4000) { last = Date.now(); store.set("pos." + id, v.currentTime); } });
+      v.addEventListener("ended", () => { store.set("pos." + id, 0); const i = ensure(); i.status = "watched"; save(); });
+    }
+  } catch (e) { $("#view").innerHTML = errorView(e); }
+}
+
 /* ---------- views ---------- */
 async function homeTvm() {
   const day = new Date().toISOString().slice(0, 10);
@@ -271,6 +345,8 @@ function route() {
   window.scrollTo(0, 0);
   if (!p.length) return home();
   if (p[0] === "search") return search();
+  if (p[0] === "free") return free();
+  if (p[0] === "ia" && /^[\w.\-]+$/.test(p[1] || "")) return iaDetail(p[1]);
   if (p[0] === "library") return library();
   if (p[0] === "settings") return settings();
   if ((p[0] === "movie" || p[0] === "tv" || p[0] === "tvm") && /^\d+$/.test(p[1] || "")) return detail(p[0], p[1]);
